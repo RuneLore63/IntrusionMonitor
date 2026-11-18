@@ -1,0 +1,6 @@
+# runtime output
+logs/
+
+# syntax-check scratch files
+_SyntaxCheck.ps1
+_syntaxresult.txt
