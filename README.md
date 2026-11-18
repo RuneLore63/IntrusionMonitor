@@ -14,6 +14,15 @@ When it's running, Intrusion Monitor quietly keeps an eye on your own computer a
 - **Your PC contacting a known-bad address** — connections or web lookups to internet infrastructure linked to the ARTEX automated-attack toolkit.
 - **A tripwire being touched** — it quietly puts a tempting-looking decoy folder (and, if allowed, a decoy network share) in place; if anything pokes at it, you hear about it immediately. Nothing legitimate ever touches that folder, so an alert there is a real signal.
 - **New devices appearing** on your local network (shown as information, not an alarm).
+- **Every incoming connection attempt, counted per address** — who has tried to connect to your PC, how many times, whether they were refused or let in, and every port number they tried. Press **Connections** to see the table.
+
+Each address is labelled by where it comes from, so your own programs never set off an alarm:
+
+| From | What it is | What happens |
+|------|-----------|--------------|
+| **This PC** | 127.0.0.1 and your PC's own addresses — programs on your computer talking to each other | Listed in grey. **Never** alarms. |
+| **Home network** | 192.168.x.x, 10.x.x.x and similar — your router, phones, TV, other PCs | Listed. A scan or repeated refusals gives an amber warning only. |
+| **Internet** | Everything else | Can raise the red alarm and the Disconnect & Block pop-up. |
 
 When the alert involves an internet address, the pop-up tells you **where it's coming from** — country, internet provider, and who owns the address — and gives you a **Disconnect & Block** button that slams the door on that address at the Windows Firewall.
 
@@ -62,6 +71,8 @@ A red alert with an internet address will pop its own window showing who's behin
 ## Logs and settings
 
 - Logs are saved in the `logs` folder next to the script, one file per day.
+- `Connections_YYYYMMDD.csv` has one line for every incoming attempt: time, address, where it's from, port, protocol, and whether it was refused or let in. `ConnectionSummary.csv` has one line per address with its totals and every port it tried. Both open in Excel. The **Open logs** button in the Connections window takes you straight there.
+- Without admin rights, only connections that actually reached your PC can be counted. Press **Elevate** to count the refused ones as well — that's where scans show up.
 - Advanced users can change colours, text size, how often it checks, and which features are on by editing the settings block at the top of `IntrusionMonitor.ps1`. You don't need to touch it to use the tool.
 
 ---

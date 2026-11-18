@@ -19,16 +19,41 @@
  DETECTIONS
    Standard user : own outbound connections vs known-bad IPs; DNS cache vs
                    known-bad domains / "artex" strings; canary tripwire; new
-                   ARP neighbours (informational).
-   Elevated adds : firewall dropped-inbound log -> port-scan detection; a decoy
-                   SMB share; and the Disconnect & Block action.
+                   ARP neighbours (informational); incoming TCP connections
+                   counted per source address.
+   Elevated adds : firewall log -> every refused (and allowed) inbound attempt
+                   counted per source address and port, port-scan detection,
+                   repeated-attempt alerts; a decoy SMB share; and the
+                   Disconnect & Block action.
+
+ WHERE A CONNECTION COMES FROM
+   This PC       127.0.0.1, ::1 and this PC's own addresses - apps on this
+                 computer talking to each other. Listed, never alarmed.
+   Home network  192.168.x.x, 10.x.x.x, 172.16-31.x.x and similar. Listed;
+                 a scan or repeated refusals gives an amber warning only.
+   Internet      everything else. Can raise the red alarm and the pop-up.
+
+ CONNECTION LOGS (logs folder)
+   Connections_YYYYMMDD.csv  one line per incoming attempt: time, source
+                             address, where from, port, protocol, refused/allowed
+   ConnectionSummary.csv     one line per source address: attempts, refused,
+                             allowed, every port tried with a count
+   The Connections button shows the same table live.
 
  USAGE
+   IntrusionMonitor.vbs             starts silently, minimised (recommended)
    Run-IntrusionMonitor.cmd         standard user (detect + alert; no blocking)
    Run-IntrusionMonitor-Admin.cmd   elevated (adds port-scan + decoy + blocking)
    Close the window, or press Stop, to end it.
 ================================================================================
 #>
+
+param(
+    # Self-test: read a saved firewall log, write the connection logs, print the counts.
+    [string]$TestFirewallLog,
+    # Self-test only: also open the Connections window on the test data.
+    [switch]$ShowConnections
+)
 
 # ---------------------------------------------------------------------------
 # CONFIG  - safe to edit
@@ -61,16 +86,26 @@ $Config = [ordered]@{
     # elevated firewall log / port scan
     AutoEnableFwLogging   = $true
     FwLogPath             = "$env:windir\system32\LogFiles\Firewall\pfirewall.log"
+    FwLogMaxKB            = 16384     # firewall log size before Windows rolls it over
     PortScanDistinctPorts = 15
     PortScanWindowSeconds = 60
     ShareDecoyEnabled     = $true
     ShareDecoyName        = "Backups"
+
+    # incoming connection counter
+    TrackInbound          = $true     # count incoming attempts per source address and port
+    LogAllowedInbound     = $true     # elevated: also count attempts the firewall let through
+    IgnoreBroadcast       = $true     # skip LAN broadcast/multicast chatter (NetBIOS, SSDP, mDNS)
+    CountThisPc           = $true     # list this PC's own apps (127.0.0.1 etc) - they never alarm
+    AlertOnHomeNetwork    = $true     # home-network devices: amber warning (no pop-up) on scans/refusals
+    DroppedAlertThreshold = 25        # warn once an address has been refused this many times
 
     # appearance (high contrast / low glare)
     BackColor             = "#101010"
     TextColor             = "#FFD400"
     HighColor             = "#FF4C4C"
     MedColor              = "#FFB000"
+    ThisPcColor           = "#C8C8C8" # rows for this PC's own apps
     FontName              = "Consolas"
     FontSize              = 14
     AlertBalloons         = $true
@@ -104,14 +139,23 @@ $script:IsAdmin = ([Security.Principal.WindowsPrincipal] `
     ).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
 $script:ScriptPath = $PSCommandPath
 
-$script:LastAlert   = @{}
-$script:ArpBaseline = $null
-$script:FwSeen      = New-Object System.Collections.Generic.HashSet[string]
-$script:CanaryQueue = [System.Collections.Queue]::Synchronized((New-Object System.Collections.Queue))
-$script:FirstSweep  = $true
-$script:Paused      = $false
-$script:IpCache     = @{}
-$script:AllowList   = @()   # IPs we must never block (self, gateway, loopback)
+$script:LastAlert    = @{}
+$script:ArpBaseline  = $null
+$script:FwPos        = -1           # read position in the firewall log (-1 = start at the end)
+$script:FwTail       = ''           # part-line carried over to the next read
+$script:FwReadable   = $false
+$script:Inbound      = @{}          # source address -> attempt record
+$script:TcpSeen      = @{}
+$script:AttemptBuf   = New-Object System.Collections.Generic.List[string]
+$script:SummaryDirty = $false
+$script:InboundNoted = $false
+$script:SelfIps      = @()
+$script:TestMode     = [bool]$TestFirewallLog
+$script:CanaryQueue  = [System.Collections.Queue]::Synchronized((New-Object System.Collections.Queue))
+$script:FirstSweep   = $true
+$script:Paused       = $false
+$script:IpCache      = @{}
+$script:AllowList    = @()          # IPs we must never block (self, gateway, loopback)
 
 function Write-Log {
     param([string]$Line)
@@ -125,7 +169,16 @@ function Write-Log {
 
 function Test-PrivateIp {
     param([string]$ip)
-    return ($ip -match '^(10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)')
+    return ($ip -match '^(10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|fe[89ab][0-9a-f]:|f[cd][0-9a-f]{2}:)')
+}
+
+function Get-Origin {
+    # This PC / Home network / Internet
+    param([string]$Ip)
+    if ($Ip -match '^(127\.|0\.0\.0\.0$|::1$|::$)') { return 'This PC' }
+    if ($script:SelfIps -contains $Ip) { return 'This PC' }
+    if (Test-PrivateIp $Ip) { return 'Home network' }
+    return 'Internet'
 }
 
 function Build-AllowList {
@@ -133,6 +186,7 @@ function Build-AllowList {
     try { $list += (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty NextHop) } catch {}
     try { $list += (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty IPAddress) } catch {}
     $script:AllowList = $list | Where-Object { $_ } | Select-Object -Unique
+    try { $script:SelfIps = @(Get-NetIPAddress -ErrorAction SilentlyContinue | Select-Object -ExpandProperty IPAddress) } catch { $script:SelfIps = @() }
 }
 
 function Get-IpInfo {
@@ -150,7 +204,7 @@ function Get-IpInfo {
             if ($j.status -eq 'success') {
                 $loc = (@($j.city,$j.regionName,$j.country) | Where-Object { $_ }) -join ', '
                 $r = [pscustomobject]@{
-                    One  = "$ip  -  $($j.country) / $($j.isp)"
+                    One  = "$($j.country) / $($j.isp)"
                     Full = "IP:    $ip`nWhere: $loc`nISP:   $($j.isp)`nOwner: $($j.org)`nAS:    $($j.as)"
                 }
             }
@@ -182,11 +236,11 @@ function Invoke-Elevate {
 function Disconnect-Ip {
     param([string]$ip)
     if (-not $script:IsAdmin) {
-        [System.Windows.Forms.MessageBox]::Show("Blocking needs the elevated launcher (Run-IntrusionMonitor-Admin.cmd).","Intrusion Monitor") | Out-Null
+        [System.Windows.Forms.MessageBox]::Show("Blocking needs admin rights - press Elevate first.","Intrusion Monitor") | Out-Null
         return
     }
-    if ($script:AllowList -contains $ip) {
-        [System.Windows.Forms.MessageBox]::Show("$ip is your own gateway/host - not blocking it (that would cut you off).","Intrusion Monitor") | Out-Null
+    if ($script:AllowList -contains $ip -or (Get-Origin $ip) -eq 'This PC') {
+        [System.Windows.Forms.MessageBox]::Show("$ip is this PC or your own gateway - not blocking it (that would cut you off).","Intrusion Monitor") | Out-Null
         return
     }
     $ts = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -222,7 +276,8 @@ function Raise-Alert {
     $stamp = $now.ToString('HH:mm:ss')
     $line  = "[{0}] {1,-4} {2}: {3}" -f $stamp, $Severity, $Category, $Detail
     Write-Log $line
-    if ($Ip) {
+    if ($script:TestMode) { return }
+    if ($Ip -and $Severity -eq 'HIGH') {
         $liFull = (Get-IpInfo $Ip).Full -replace "`r?`n", "; "
         $liDir  = if ($Direction) { "$Direction; " } else { "" }
         Write-Log ("           source -> " + $liDir + $liFull)
@@ -277,7 +332,7 @@ function Show-InteractiveAlert {
     $box.Font = New-Object System.Drawing.Font($Config.FontName, $Config.FontSize)
     $box.Location = New-Object System.Drawing.Point(18,56)
     $box.Size = New-Object System.Drawing.Size(510, 200)
-    $box.Text = "$Detail`n`n$dirTxt`n$($info.Full)"
+    $box.Text = "$Detail`r`n`r`n$dirTxt`r`n$($info.Full -replace "`n", "`r`n")"
     $f.Controls.Add($box)
 
     $block = New-Object System.Windows.Forms.Button
@@ -286,7 +341,8 @@ function Show-InteractiveAlert {
     $block.Location = New-Object System.Drawing.Point(18,268)
     $block.FlatStyle = 'Flat'; $block.ForeColor = [System.Drawing.ColorTranslator]::FromHtml($Config.HighColor)
     $block.Font = New-Object System.Drawing.Font($Config.FontName, ($Config.FontSize-2), [System.Drawing.FontStyle]::Bold)
-    $block.Add_Click({ Disconnect-Ip -ip $Ip; $f.Close() }.GetNewClosure())
+    $block.Tag = $Ip
+    $block.Add_Click({ $frm = $this.FindForm(); Disconnect-Ip -ip ([string]$this.Tag); $frm.Close() })
     if (-not $script:IsAdmin) { $block.Enabled = $false; $block.Text = "Block (needs admin)" }
     $f.Controls.Add($block)
 
@@ -295,7 +351,7 @@ function Show-InteractiveAlert {
     $dismiss.Location = New-Object System.Drawing.Point(234,268)
     $dismiss.FlatStyle = 'Flat'; $dismiss.ForeColor = [System.Drawing.ColorTranslator]::FromHtml($Config.TextColor)
     $dismiss.Font = New-Object System.Drawing.Font($Config.FontName, ($Config.FontSize-2))
-    $dismiss.Add_Click({ $f.Close() }.GetNewClosure())
+    $dismiss.Add_Click({ $this.FindForm().Close() })
     $f.Controls.Add($dismiss)
 
     $f.Show()
@@ -344,31 +400,316 @@ function Check-Arp {
     $script:ArpBaseline = $now
 }
 
-function Check-FirewallLog {
-    if (-not $script:IsAdmin) { return }
-    if (-not (Test-Path $Config.FwLogPath)) { return }
+# -------- incoming connection counter -----------------------------------------
+function Test-SkipAddress {
+    param([string]$Src,[string]$Dst)
+    if (-not $Src -or $Src -eq '-') { return $true }
+    if (-not $Config.CountThisPc -and (Get-Origin $Src) -eq 'This PC') { return $true }
+    if ($Config.IgnoreBroadcast -and $Dst) {
+        if ($Dst -match '^(255\.255\.255\.255|22[4-9]\.|23[0-9]\.|ff[0-9a-f]{2}:)') { return $true }
+        if ($Dst -match '\.255$') { return $true }
+    }
+    return $false
+}
+
+function Get-PortsText {
+    param($Rec,[int]$Max = 0)
+    $items = @($Rec.Ports.GetEnumerator() | Sort-Object -Property Value -Descending)
+    if ($Max -gt 0) { $items = @($items | Select-Object -First $Max) }
+    $txt = ($items | ForEach-Object { "$($_.Key) x$($_.Value)" }) -join '; '
+    if ($Max -gt 0 -and $Rec.Ports.Count -gt $Max) { $txt += "; +$($Rec.Ports.Count - $Max) more" }
+    return $txt
+}
+
+function Add-Attempt {
+    param([string]$Ip,[int]$Port,[string]$Proto,[string]$Action,[string]$Via,[object]$When)
+    if (-not $When) { $When = Get-Date }
+    if (-not $script:Inbound.ContainsKey($Ip)) {
+        $script:Inbound[$Ip] = [pscustomobject]@{
+            Ip = $Ip; Origin = (Get-Origin $Ip); Attempts = 0; Dropped = 0; Allowed = 0; Ports = @{}
+            First = $When; Last = $When; Recent = (New-Object System.Collections.ArrayList); Alerted = $false
+        }
+    }
+    $r = $script:Inbound[$Ip]
+    $r.Attempts = $r.Attempts + 1
+    if ($Action -eq 'DROP') { $r.Dropped = $r.Dropped + 1 } else { $r.Allowed = $r.Allowed + 1 }
+    $pk = if ($Proto -like 'ICMP*') { 'ICMP' } else { "$Port/$Proto" }
+    if ($r.Ports.ContainsKey($pk)) { $r.Ports[$pk] = $r.Ports[$pk] + 1 } else { $r.Ports[$pk] = 1 }
+    if ($When -lt $r.First) { $r.First = $When }
+    if ($When -gt $r.Last)  { $r.Last  = $When }
+    [void]$r.Recent.Add([pscustomobject]@{ T = $When; P = $pk })
+    $script:SummaryDirty = $true
+    $act = switch ($Action) { 'DROP' { 'refused' } 'ALLOW' { 'allowed' } default { $Action.ToLower() } }
+    $portOut = if ($pk -eq 'ICMP') { '' } else { $Port }
+    $script:AttemptBuf.Add(('{0:yyyy-MM-dd HH:mm:ss},{1},{2},{3},{4},{5},{6}' -f $When, $Ip, $r.Origin, $portOut, $Proto, $act, $Via))
+}
+
+function Read-FirewallNew {
+    # returns only the lines added to the firewall log since the last read
+    $lines = New-Object System.Collections.Generic.List[string]
+    $path = $Config.FwLogPath
+    if (-not $path -or -not (Test-Path $path)) { return $lines }
+    $fs = $null
+    try {
+        $fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $script:FwReadable = $true
+        $len = $fs.Length
+        if ($script:FwPos -lt 0) { $script:FwPos = $len; return $lines }      # first read: count from now on
+        if ($len -lt $script:FwPos) { $script:FwPos = 0; $script:FwTail = '' } # log rolled over
+        if ($len -gt $script:FwPos) {
+            [void]$fs.Seek($script:FwPos, [System.IO.SeekOrigin]::Begin)
+            $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::ASCII)
+            $text = $script:FwTail + $sr.ReadToEnd()
+            $script:FwPos = $fs.Position
+            $parts = $text -split "`r?`n"
+            $script:FwTail = $parts[$parts.Count - 1]
+            for ($i = 0; $i -lt $parts.Count - 1; $i++) { if ($parts[$i]) { $lines.Add($parts[$i]) } }
+        }
+    } catch {
+        $script:FwReadable = $false
+    } finally {
+        if ($fs) { $fs.Dispose() }
+    }
+    return $lines
+}
+
+function Process-FwLine {
+    # fields: date time action protocol src-ip dst-ip src-port dst-port size tcpflags tcpsyn tcpack tcpwin icmptype icmpcode info path [pid]
+    param([string]$Line)
+    if (-not $Line -or $Line.StartsWith('#')) { return }
+    $p = $Line.Trim() -split '\s+'
+    if ($p.Count -lt 8) { return }
+    $action = $p[2]
+    if ($action -ne 'DROP' -and $action -ne 'ALLOW') { return }
+    $path = ''
+    if ($p.Count -gt 16) { $path = $p[16] }
+    if ($path) {
+        if ($path -ne 'RECEIVE') { return }        # inbound only
+    } elseif ($action -eq 'ALLOW') {
+        return                                     # old log format: direction unknown
+    }
+    $proto = $p[3]; $src = $p[4]; $dst = $p[5]; $dport = $p[7]
+    if ($dport -notmatch '^[0-9]+$') {
+        if ($proto -like 'ICMP*') { $dport = '0' } else { return }
+    }
+    if (Test-SkipAddress $src $dst) { return }
+    $dt = [datetime]::MinValue
+    if (-not [datetime]::TryParse("$($p[0]) $($p[1])", [ref]$dt)) { $dt = Get-Date }
+    Add-Attempt -Ip $src -Port ([int]$dport) -Proto $proto -Action $action -Via 'firewall' -When $dt
+    return $src
+}
+
+function Check-InboundTcp {
+    # without admin: count new incoming TCP connections to this PC's listening ports
+    param([hashtable]$Touched)
+    try {
+        $listen = @(Get-NetTCPConnection -State Listen -ErrorAction Stop | Select-Object -ExpandProperty LocalPort -Unique)
+        $conns  = @(Get-NetTCPConnection -State Established,SynReceived -ErrorAction SilentlyContinue)
+    } catch { return }
+    $now = Get-Date
+    $live = @{}
+    foreach ($c in $conns) {
+        if ($listen -notcontains $c.LocalPort) { continue }
+        $ra = [string]$c.RemoteAddress
+        if (Test-SkipAddress $ra ([string]$c.LocalAddress)) { continue }
+        $k = "$ra|$($c.RemotePort)|$($c.LocalPort)"
+        $live[$k] = $true
+        if (-not $script:TcpSeen.ContainsKey($k)) {
+            Add-Attempt -Ip $ra -Port ([int]$c.LocalPort) -Proto 'TCP' -Action 'CONNECTED' -Via 'tcp' -When $now
+            $Touched[$ra] = $true
+        }
+    }
+    $script:TcpSeen = $live
+}
+
+function Check-Inbound {
+    if (-not $Config.TrackInbound) { return }
+    $touched = @{}
+    foreach ($ln in (Read-FirewallNew)) {
+        $ip = Process-FwLine $ln
+        if ($ip) { $touched[$ip] = $true }
+    }
+    if (-not $script:FwReadable -and -not $script:TestMode) { Check-InboundTcp $touched }
     $cutoff = (Get-Date).AddSeconds(-$Config.PortScanWindowSeconds)
-    $recent = @{}
-    try { $lines = Get-Content -Path $Config.FwLogPath -Tail 800 -ErrorAction Stop } catch { return }
-    foreach ($ln in $lines) {
-        if ($ln.StartsWith('#') -or [string]::IsNullOrWhiteSpace($ln)) { continue }
-        if (-not $script:FwSeen.Add($ln)) { continue }
-        $p = $ln -split '\s+'
-        if ($p.Count -lt 8 -or $p[2] -ne 'DROP') { continue }
-        $dt = $null; [void][DateTime]::TryParse("$($p[0]) $($p[1])", [ref]$dt)
-        if ($dt -and $dt -lt $cutoff) { continue }
-        $src = $p[4]; $dport = $p[7]
-        if ($src -match '^\d+\.\d+\.\d+\.\d+$' -and $dport -match '^\d+$') {
-            if (-not $recent.ContainsKey($src)) { $recent[$src] = New-Object System.Collections.Generic.HashSet[string] }
-            [void]$recent[$src].Add($dport)
+    foreach ($ip in @($touched.Keys)) {
+        $r = $script:Inbound[$ip]
+        for ($i = $r.Recent.Count - 1; $i -ge 0; $i--) { if ($r.Recent[$i].T -lt $cutoff) { $r.Recent.RemoveAt($i) } }
+
+        # apps on this PC never alarm; home network warns (amber) only; internet can alarm (red + pop-up)
+        if ($r.Origin -eq 'This PC') { continue }
+        if ($r.Origin -eq 'Home network' -and -not $Config.AlertOnHomeNetwork) { continue }
+        $sev = if ($r.Origin -eq 'Internet') { 'HIGH' } else { 'MED' }
+
+        $distinct = @($r.Recent | ForEach-Object { $_.P } | Select-Object -Unique).Count
+        if ($distinct -ge $Config.PortScanDistinctPorts) {
+            Raise-Alert $sev 'Inbound port scan' "$ip ($($r.Origin)) tried $distinct different ports on this PC in $($Config.PortScanWindowSeconds)s ($($r.Attempts) attempts in total)." "scan-$ip" $ip 'Inbound (them -> this PC)'
+        }
+        if (-not $r.Alerted -and $r.Dropped -ge $Config.DroppedAlertThreshold) {
+            $r.Alerted = $true
+            Raise-Alert $sev 'Repeated connection attempts' "$ip ($($r.Origin)) has been refused $($r.Dropped) times. Ports: $(Get-PortsText $r 6)" "rep-$ip" $ip 'Inbound (them -> this PC)'
         }
     }
-    foreach ($src in $recent.Keys) {
-        if ($recent[$src].Count -ge $Config.PortScanDistinctPorts) {
-            Raise-Alert HIGH 'Inbound port scan' "$src probed $($recent[$src].Count) ports on this PC in $($Config.PortScanWindowSeconds)s." "scan-$src" $src 'Inbound (them -> this PC)'
-        }
+}
+
+function Flush-AttemptLog {
+    if ($script:AttemptBuf.Count -eq 0) { return }
+    if ($Config.Logging) {
+        try {
+            if (-not (Test-Path $Config.LogDir)) { New-Item -ItemType Directory -Path $Config.LogDir -Force | Out-Null }
+            $f = Join-Path $Config.LogDir ("Connections_{0:yyyyMMdd}.csv" -f (Get-Date))
+            if (-not (Test-Path $f)) { Set-Content -Path $f -Value 'Time,SourceIP,From,Port,Protocol,Action,Source' -Encoding UTF8 }
+            Add-Content -Path $f -Value $script:AttemptBuf.ToArray() -Encoding UTF8
+        } catch { Write-Log "[connections log] $($_.Exception.Message)" }
     }
-    if ($script:FwSeen.Count -gt 5000) { $script:FwSeen.Clear() }
+    $script:AttemptBuf.Clear()
+}
+
+function Get-SortedInbound {
+    # internet first, then home network, then this PC; busiest first within each
+    $rank = @{ 'Internet' = 0; 'Home network' = 1; 'This PC' = 2 }
+    return @($script:Inbound.Values | Sort-Object -Property @{ Expression = { $rank[$_.Origin] } }, @{ Expression = { $_.Attempts }; Descending = $true })
+}
+
+function Write-Summary {
+    if (-not $script:SummaryDirty -or -not $Config.Logging) { return }
+    $script:SummaryDirty = $false
+    try {
+        if (-not (Test-Path $Config.LogDir)) { New-Item -ItemType Directory -Path $Config.LogDir -Force | Out-Null }
+        $f = Join-Path $Config.LogDir 'ConnectionSummary.csv'
+        $out = New-Object System.Collections.Generic.List[string]
+        $out.Add('SourceIP,From,Attempts,Refused,Allowed,DistinctPorts,Ports,FirstSeen,LastSeen')
+        foreach ($r in (Get-SortedInbound)) {
+            $out.Add(('{0},{1},{2},{3},{4},{5},"{6}",{7:yyyy-MM-dd HH:mm:ss},{8:yyyy-MM-dd HH:mm:ss}' -f $r.Ip, $r.Origin, $r.Attempts, $r.Dropped, $r.Allowed, $r.Ports.Count, (Get-PortsText $r 0), $r.First, $r.Last))
+        }
+        Set-Content -Path $f -Value $out.ToArray() -Encoding UTF8
+    } catch { Write-Log "[summary] $($_.Exception.Message)" }
+}
+
+function Update-ConnGrid {
+    $g = $script:ConnGrid
+    if (-not $g -or $g.IsDisposed) { return }
+    $sel = $null
+    if ($g.CurrentRow) { $sel = [string]$g.CurrentRow.Cells['Ip'].Value }
+    $top = $g.FirstDisplayedScrollingRowIndex
+    $sc = $g.SortedColumn; $so = $g.SortOrder
+    $pcFg   = [System.Drawing.ColorTranslator]::FromHtml($Config.ThisPcColor)
+    $highFg = [System.Drawing.ColorTranslator]::FromHtml($Config.HighColor)
+    $g.Rows.Clear()
+    $total = 0; $refused = 0; $fromNet = 0
+    foreach ($r in (Get-SortedInbound)) {
+        $total += $r.Attempts; $refused += $r.Dropped
+        if ($r.Origin -eq 'Internet') { $fromNet++ }
+        $where = switch ($r.Origin) {
+            'This PC'      { 'An app on this PC' }
+            'Home network' { 'A device on your home network' }
+            default        { if ($script:IpCache.ContainsKey($r.Ip)) { $script:IpCache[$r.Ip].One } else { '(select, then Look up)' } }
+        }
+        $i = $g.Rows.Add($r.Ip, $r.Origin, [int]$r.Attempts, [int]$r.Dropped, [int]$r.Allowed, [int]$r.Ports.Count, (Get-PortsText $r 0), $r.Last.ToString('dd/MM HH:mm:ss'), $where)
+        if ($r.Origin -eq 'This PC') { $g.Rows[$i].DefaultCellStyle.ForeColor = $pcFg }
+        elseif ($r.Origin -eq 'Internet' -and $r.Dropped -gt 0) { $g.Rows[$i].DefaultCellStyle.ForeColor = $highFg }
+        if ($sel -and $r.Ip -eq $sel) { $g.CurrentCell = $g.Rows[$i].Cells[0] }
+    }
+    if ($sc) {
+        $dir = if ($so -eq 'Ascending') { [System.ComponentModel.ListSortDirection]::Ascending } else { [System.ComponentModel.ListSortDirection]::Descending }
+        $g.Sort($sc, $dir)
+    }
+    if ($top -ge 0 -and $top -lt $g.Rows.Count) { try { $g.FirstDisplayedScrollingRowIndex = $top } catch {} }
+    if ($script:ConnLabel) {
+        $src = if ($script:FwReadable) { 'firewall log' } else { 'live TCP only (Elevate to count refused attempts)' }
+        $script:ConnLabel.Text = "Addresses: $($script:Inbound.Count) ($fromNet from the internet)    Attempts: $total    Refused: $refused    Source: $src    Updated $(Get-Date -Format 'HH:mm:ss')"
+    }
+}
+
+function Show-Connections {
+    if ($script:ConnForm -and -not $script:ConnForm.IsDisposed) {
+        $script:ConnForm.WindowState = 'Normal'; $script:ConnForm.Activate(); Update-ConnGrid; return
+    }
+    $bg   = [System.Drawing.ColorTranslator]::FromHtml($Config.BackColor)
+    $fg   = [System.Drawing.ColorTranslator]::FromHtml($Config.TextColor)
+    $fnt  = New-Object System.Drawing.Font($Config.FontName, ($Config.FontSize - 2))
+    $fntB = New-Object System.Drawing.Font($Config.FontName, ($Config.FontSize - 2), [System.Drawing.FontStyle]::Bold)
+
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = 'Intrusion Monitor - incoming connection attempts'
+    $f.Size = New-Object System.Drawing.Size(1400, 700)
+    $f.StartPosition = 'CenterScreen'
+    $f.BackColor = $bg
+
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.ForeColor = $fg; $lbl.Font = $fnt; $lbl.AutoSize = $true
+    $lbl.Location = New-Object System.Drawing.Point(12, 10)
+    $f.Controls.Add($lbl)
+
+    $g = New-Object System.Windows.Forms.DataGridView
+    $g.Location = New-Object System.Drawing.Point(12, 40)
+    $g.Size = New-Object System.Drawing.Size(1360, 550)
+    $g.Anchor = 'Top,Bottom,Left,Right'
+    $g.ReadOnly = $true; $g.AllowUserToAddRows = $false; $g.AllowUserToDeleteRows = $false; $g.AllowUserToResizeRows = $false
+    $g.RowHeadersVisible = $false; $g.SelectionMode = 'FullRowSelect'; $g.MultiSelect = $false
+    $g.AutoSizeColumnsMode = 'Fill'; $g.AutoSizeRowsMode = 'AllCells'
+    $g.BackgroundColor = $bg; $g.GridColor = [System.Drawing.Color]::DimGray; $g.BorderStyle = 'None'
+    $g.EnableHeadersVisualStyles = $false
+    $g.ColumnHeadersDefaultCellStyle.BackColor = $bg
+    $g.ColumnHeadersDefaultCellStyle.ForeColor = $fg
+    $g.ColumnHeadersDefaultCellStyle.Font = $fntB
+    $g.ColumnHeadersHeightSizeMode = 'AutoSize'
+    $g.DefaultCellStyle.BackColor = $bg; $g.DefaultCellStyle.ForeColor = $fg; $g.DefaultCellStyle.Font = $fnt
+    $g.DefaultCellStyle.SelectionBackColor = $fg; $g.DefaultCellStyle.SelectionForeColor = $bg
+    $g.DefaultCellStyle.WrapMode = 'True'
+    $cols = @(
+        @('Ip', 'Source address', 13, $null),
+        @('Origin', 'From', 9, $null),
+        @('Attempts', 'Attempts', 7, [int]),
+        @('Refused', 'Refused', 7, [int]),
+        @('Allowed', 'Let in', 6, [int]),
+        @('PortCount', 'Ports', 5, [int]),
+        @('Ports', 'Ports tried (port/protocol x count)', 30, $null),
+        @('Last', 'Last seen', 10, $null),
+        @('Where', 'Where from', 15, $null)
+    )
+    foreach ($c in $cols) {
+        $col = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+        $col.Name = $c[0]; $col.HeaderText = $c[1]; $col.FillWeight = $c[2]
+        if ($c[3]) { $col.ValueType = $c[3] }
+        [void]$g.Columns.Add($col)
+    }
+    $f.Controls.Add($g)
+
+    $mk = {
+        param($text, $x)
+        $b = New-Object System.Windows.Forms.Button
+        $b.Text = $text; $b.Location = New-Object System.Drawing.Point($x, 604)
+        $b.Size = New-Object System.Drawing.Size(200, 36); $b.Anchor = 'Bottom,Left'
+        $b.FlatStyle = 'Flat'; $b.ForeColor = $fg; $b.Font = $fnt
+        $b
+    }
+    $bRefresh = & $mk 'Refresh' 12
+    $bLookup  = & $mk 'Look up' 222
+    $bBlock   = & $mk 'Block' 432
+    $bFolder  = & $mk 'Open logs' 642
+    $bClose   = & $mk 'Close' 852
+    $bRefresh.Add_Click({ Update-ConnGrid })
+    $bLookup.Add_Click({
+        $cg = $script:ConnGrid
+        if ($cg -and $cg.CurrentRow) { [void](Get-IpInfo ([string]$cg.CurrentRow.Cells['Ip'].Value)); Update-ConnGrid }
+    })
+    $bBlock.Add_Click({
+        $cg = $script:ConnGrid
+        if ($cg -and $cg.CurrentRow) { Disconnect-Ip -ip ([string]$cg.CurrentRow.Cells['Ip'].Value) }
+    })
+    if (-not $script:IsAdmin) { $bBlock.Enabled = $false; $bBlock.Text = 'Block (needs admin)' }
+    $bFolder.Add_Click({
+        $d = $script:Config.LogDir
+        if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+        Start-Process explorer.exe $d
+    })
+    $bClose.Add_Click({ $this.FindForm().Close() })
+    $f.Controls.AddRange(@($bRefresh, $bLookup, $bBlock, $bFolder, $bClose))
+
+    $script:ConnForm = $f; $script:ConnGrid = $g; $script:ConnLabel = $lbl
+    $f.Add_FormClosed({ $script:ConnForm = $null; $script:ConnGrid = $null; $script:ConnLabel = $null })
+    Update-ConnGrid
+    $f.Show()
 }
 
 function Check-CanaryQueue {
@@ -404,8 +745,13 @@ function Setup-Canary {
 function Setup-ElevatedExtras {
     if (-not $script:IsAdmin) { return }
     if ($Config.AutoEnableFwLogging) {
-        try { netsh advfirewall set allprofiles logging droppedconnections enable | Out-Null; Write-Log "[init] Firewall dropped-connection logging enabled." }
-        catch { Write-Log "[init] Could not enable firewall logging: $($_.Exception.Message)" }
+        try {
+            netsh advfirewall set allprofiles logging droppedconnections enable | Out-Null
+            if ($Config.LogAllowedInbound) { netsh advfirewall set allprofiles logging allowedconnections enable | Out-Null }
+            netsh advfirewall set allprofiles logging maxfilesize $Config.FwLogMaxKB | Out-Null
+            $what = if ($Config.LogAllowedInbound) { 'refused + allowed' } else { 'refused' }
+            Write-Log "[init] Firewall connection logging enabled ($what)."
+        } catch { Write-Log "[init] Could not enable firewall logging: $($_.Exception.Message)" }
     }
     if ($Config.ShareDecoyEnabled -and $Config.CanaryEnabled) {
         try {
@@ -420,13 +766,40 @@ function Setup-ElevatedExtras {
 # -------- sweep ---------------------------------------------------------------
 function Invoke-Sweep {
     if ($script:Paused) { return }
-    Check-Connections; Check-DnsCache; Check-Arp; Check-FirewallLog; Check-CanaryQueue
+    Check-Connections; Check-DnsCache; Check-Arp; Check-Inbound; Check-CanaryQueue
+    Flush-AttemptLog; Write-Summary
+    if (-not $script:InboundNoted -and $Config.TrackInbound) {
+        $script:InboundNoted = $true
+        $how = if ($script:FwReadable) { 'Windows Firewall log (refused + allowed attempts, every port)' } else { 'live TCP connections only - press Elevate to count refused attempts and port scans' }
+        Raise-Alert INFO 'Incoming counter' "Counting incoming attempts from: $how. Apps on this PC are listed but never alarm." 'inbound-noted'
+    }
+    if ($script:ConnForm -and -not $script:ConnForm.IsDisposed) { Update-ConnGrid }
     $script:FirstSweep = $false
     if ($script:Status) {
         $mode = if ($script:IsAdmin) { 'ELEVATED' } else { 'not elevated' }
         $state = if ($script:Paused) { 'PAUSED' } else { 'watching' }
         $script:Status.Invoke([Action]{ $script:Status.Text = "Mode: $mode   |   Last sweep: $(Get-Date -Format 'HH:mm:ss')   |   $state" })
     }
+}
+
+# -------- self-test (no main window) ------------------------------------------
+if ($TestFirewallLog) {
+    $Config.LogDir    = Join-Path $PSScriptRoot 'logs\test'
+    if (Test-Path $Config.LogDir) { Remove-Item -Path $Config.LogDir -Recurse -Force -ErrorAction SilentlyContinue }
+    $Config.FwLogPath = $TestFirewallLog
+    $script:FwPos     = 0
+    Build-AllowList
+    Check-Inbound
+    Flush-AttemptLog; Write-Summary
+    "Addresses: $($script:Inbound.Count)"
+    foreach ($r in (Get-SortedInbound)) {
+        '{0} [{1}]  attempts={2} refused={3} allowed={4}  ports: {5}' -f $r.Ip, $r.Origin, $r.Attempts, $r.Dropped, $r.Allowed, (Get-PortsText $r 0)
+    }
+    if ($ShowConnections) {
+        Show-Connections
+        [System.Windows.Forms.Application]::Run($script:ConnForm)
+    }
+    return
 }
 
 # -------- main window ---------------------------------------------------------
@@ -473,12 +846,14 @@ $btnPause = New-Btn 'Pause' 16
 $btnClear = New-Btn 'Clear log' 176
 $ctxText = if ($script:IsAdmin) { 'Clear blocks' } else { 'Elevate' }
 $btnContext = New-Btn $ctxText 336
-$btnStop  = New-Btn 'Stop'  496
+$btnConn  = New-Btn 'Connections' 496
+$btnStop  = New-Btn 'Stop'  656
 $btnPause.Add_Click({ $script:Paused = -not $script:Paused; $btnPause.Text = if ($script:Paused) {'Resume'} else {'Pause'} })
 $btnClear.Add_Click({ $script:LogBox.Clear() })
 if ($script:IsAdmin) { $btnContext.Add_Click({ Clear-Blocks }) } else { $btnContext.Add_Click({ Invoke-Elevate }) }
+$btnConn.Add_Click({ Show-Connections })
 $btnStop.Add_Click({ $form.Close() })
-$form.Controls.AddRange(@($btnPause,$btnClear,$btnContext,$btnStop))
+$form.Controls.AddRange(@($btnPause,$btnClear,$btnContext,$btnConn,$btnStop))
 
 $script:Tray = New-Object System.Windows.Forms.NotifyIcon
 $script:Tray.Icon = [System.Drawing.SystemIcons]::Shield
@@ -500,6 +875,8 @@ $form.Add_FormClosing({
     try { Get-EventSubscriber | Where-Object { $_.SourceObject -is [System.IO.FileSystemWatcher] } | Unregister-Event -ErrorAction SilentlyContinue } catch {}
     if ($script:Fsw) { $script:Fsw.EnableRaisingEvents = $false; $script:Fsw.Dispose() }
     if ($script:Tray) { $script:Tray.Visible = $false; $script:Tray.Dispose() }
+    Flush-AttemptLog; Write-Summary
+    if ($script:ConnForm -and -not $script:ConnForm.IsDisposed) { $script:ConnForm.Close() }
     Write-Log "[stop] Intrusion Monitor closed."
 })
 
