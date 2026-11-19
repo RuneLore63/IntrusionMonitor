@@ -1,5 +1,6 @@
 # runtime output
 logs/
+data/
 
 # syntax-check and test scratch files
 _SyntaxCheck.ps1
