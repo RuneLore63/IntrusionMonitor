@@ -25,7 +25,7 @@
                   counted per source address.
    Elevated adds: firewall log -> every refused (and allowed) inbound attempt
                   counted per source address and port, port-scan detection,
-                  repeated-attempt alerts; a decoy SMB share; Disconnect & Block.
+                  repeated-attempt alerts; Disconnect & Block; optional decoy SMB share.
 
  WHERE A CONNECTION COMES FROM
    This PC       127.0.0.1, ::1 and this PC's own addresses. Listed, never alarmed.
@@ -124,7 +124,8 @@ $Config = [ordered]@{
     FwLogMaxKB            = 16384
     PortScanDistinctPorts = 15
     PortScanWindowSeconds = 60
-    ShareDecoyEnabled     = $true
+    ShareDecoyEnabled     = $false    # publish a decoy 'Backups' network share (elevated). Off by default:
+                                      # it makes this PC visible on any network it joins, including public Wi-Fi
     ShareDecoyName        = "Backups"
 
     # incoming connection counter
@@ -224,6 +225,21 @@ $script:NetContext   = $null
 $script:LastNet      = [datetime]::MinValue
 $script:LastClock    = [datetime]::MinValue
 $script:LastClockInfo = $null
+$script:OtherFw      = @()   # third-party firewall(s) in charge instead of Windows Firewall
+
+function Get-ThirdPartyFirewall {
+    # Windows Security Center lists the active firewall. If it is not Windows Firewall, pfirewall.log stays empty.
+    try {
+        return @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName FirewallProduct -ErrorAction Stop |
+                 Where-Object { (([int]$_.productState -shr 12) -band 0xF) -eq 1 } |
+                 ForEach-Object { [string]$_.displayName } | Select-Object -Unique)
+    } catch { return @() }
+}
+
+function Test-UseTcpMode {
+    if ($script:TestMode) { return $false }
+    return (-not $script:FwReadable -or $script:OtherFw.Count -gt 0)
+}
 
 function Write-Log {
     param([string]$Line)
@@ -875,6 +891,7 @@ function Get-NetContext {
             $gw = @()
             $gw += @($c.IPv4DefaultGateway | ForEach-Object { [string]$_.NextHop })
             $gw += @($c.IPv6DefaultGateway | ForEach-Object { [string]$_.NextHop })
+            $gw = @($gw | Where-Object { $_ })
             $gwMac = @($gw | Where-Object { $script:NeighborMap.ContainsKey($_) } | ForEach-Object { "$_ = $($script:NeighborMap[$_])" })
             $ifs += [ordered]@{
                 alias       = [string]$c.InterfaceAlias
@@ -990,8 +1007,14 @@ function Disconnect-Ip {
             New-NetFirewallRule -DisplayName "IM-Block-OUT-$ip-$ts" -Group $Config.FirewallGroup -Direction Outbound -RemoteAddress $ip -Action Block -Profile Any -ErrorAction Stop | Out-Null
             $made += "IM-Block-OUT-$ip-$ts"
         }
-        Write-Evidence 'BLOCK' ([ordered]@{ ip = $ip; rules = $made; bothDirections = [bool]$Config.BlockBothDirections })
-        Raise-Alert HIGH 'Blocked' "Firewall now dropping all traffic to/from $ip."
+        Write-Evidence 'BLOCK' ([ordered]@{ ip = $ip; rules = $made; bothDirections = [bool]$Config.BlockBothDirections; firewallProduct = $(if ($script:OtherFw.Count) { $script:OtherFw -join ' / ' } else { 'Windows Firewall' }) })
+        if ($script:OtherFw.Count) {
+            $fwName = $script:OtherFw -join ' / '
+            Raise-Alert MED 'Block rule added' "Windows Firewall rules added for $ip, BUT your firewall is $fwName, which may ignore them. Block $ip in $fwName as well."
+            [System.Windows.Forms.MessageBox]::Show("Block rules for $ip were added to Windows Firewall.`n`nYour PC's firewall is $fwName, not Windows Firewall, so those rules may not take effect. To be sure, also block $ip in $fwName (usually Settings > Firewall > Networks or Addresses).","Intrusion Monitor") | Out-Null
+        } else {
+            Raise-Alert HIGH 'Blocked' "Firewall now dropping all traffic to/from $ip."
+        }
     } catch {
         Write-Log "[block] $($_.Exception.Message)"
         [System.Windows.Forms.MessageBox]::Show("Block failed: $($_.Exception.Message)","Intrusion Monitor") | Out-Null
@@ -1141,14 +1164,15 @@ function Check-Arp {
     if (-not $Config.ArpWatchEnabled) { return }
     try {
         $now = Get-NetNeighbor -AddressFamily IPv4 -ErrorAction Stop |
-               Where-Object { $_.State -in 'Reachable','Stale','Permanent' -and $_.IPAddress -notmatch '^(224\.|239\.|255\.)' } |
+               Where-Object { $_.State -in 'Reachable','Stale','Permanent','Delay','Probe' -and $_.IPAddress -notmatch '^(224\.|239\.|255\.)' -and
+                              [string]$_.LinkLayerAddress -match '^[0-9A-Fa-f]{2}([-:][0-9A-Fa-f]{2}){5}$' -and [string]$_.LinkLayerAddress -notmatch '^(00-){5}00$|^(FF-){5}FF$' } |
                Select-Object IPAddress, LinkLayerAddress
     } catch { return }
     $ips = @($now | ForEach-Object { [string]$_.IPAddress } | Select-Object -Unique)
     if ($script:FirstSweep -or -not $script:ArpBaseline) { $script:ArpBaseline = $ips; return }
     foreach ($n in $now) {
         $ip = [string]$n.IPAddress
-        if ($script:ArpBaseline -notcontains $ip) {
+        if ($script:ArpBaseline -notcontains $ip -and $script:AllowList -notcontains $ip) {
             $mac = [string]$n.LinkLayerAddress
             $mk = Get-MacMaker $mac
             Write-Evidence 'NEIGHBOUR' ([ordered]@{ ip = $ip; mac = $mac; macMaker = $mk })
@@ -1335,12 +1359,12 @@ function Check-Inbound {
     if (-not $Config.TrackInbound) { return }
     $touched = @{}
     $new = Read-FirewallNew
-    if ($new.Count -gt 0 -or (-not $script:FwReadable -and -not $script:TestMode)) { Update-Snapshots }
+    if ($new.Count -gt 0 -or (Test-UseTcpMode)) { Update-Snapshots }
     foreach ($ln in $new) {
         $ip = Process-FwLine $ln
         if ($ip) { $touched[$ip] = $true }
     }
-    if (-not $script:FwReadable -and -not $script:TestMode) { Check-InboundTcp $touched }
+    if (Test-UseTcpMode) { Check-InboundTcp $touched }
     $cutoff = (Get-Date).AddSeconds(-$Config.PortScanWindowSeconds)
     foreach ($ip in @($touched.Keys)) {
         $r = $script:Inbound[$ip]
@@ -1627,7 +1651,7 @@ function Update-ConnGrid {
     }
     if ($top -ge 0 -and $top -lt $g.Rows.Count) { try { $g.FirstDisplayedScrollingRowIndex = $top } catch {} }
     if ($script:ConnLabel) {
-        $src = if ($script:FwReadable) { 'firewall log' } else { 'live TCP only (Elevate to count refused attempts)' }
+        $src = if ($script:OtherFw.Count) { "live TCP ($($script:OtherFw -join ' / ') is your firewall)" } elseif ($script:FwReadable) { 'firewall log' } else { 'live TCP only (Elevate to count refused attempts)' }
         $bg = if ($script:Jobs.Count) { "    Lookups running: $($script:Jobs.Count)" } else { '' }
         $script:ConnLabel.Text = "Addresses: $($script:Inbound.Count) ($fromNet from the internet)    Attempts: $total    Refused: $refused    Source: $src    Updated $(Get-Date -Format 'HH:mm:ss')$bg"
     }
@@ -1827,6 +1851,7 @@ function Write-StartRecord {
         timeZone = $tz.Id; utcOffset = $tz.GetUtcOffset([datetime]::Now).ToString()
         elevated = [bool]$script:IsAdmin; testMode = [bool]$script:TestMode
         firewallLog = $Config.FwLogPath
+        firewallProduct = $(if ($script:OtherFw.Count) { $script:OtherFw -join ' / ' } else { 'Windows Firewall' })
         settings = [ordered]@{
             scanIntervalSeconds = $Config.ScanIntervalSeconds; trackInbound = $Config.TrackInbound
             logAllowedInbound = $Config.LogAllowedInbound; autoIdentify = $Config.AutoIdentify
@@ -1858,7 +1883,9 @@ function Invoke-Sweep {
     Flush-AttemptLog; Write-Summary; Flush-Evidence
     if (-not $script:InboundNoted -and $Config.TrackInbound) {
         $script:InboundNoted = $true
-        $how = if ($script:FwReadable) { 'Windows Firewall log (refused + allowed attempts, every port)' } else { 'live TCP connections only - press Elevate to count refused attempts and port scans' }
+        $how = if ($script:OtherFw.Count) { "live TCP connections. Your firewall is $($script:OtherFw -join ' / '), so the Windows Firewall log stays empty; refused attempts are recorded in that product's own reports" }
+               elseif ($script:FwReadable) { 'Windows Firewall log (refused + allowed attempts, every port)' }
+               else { 'live TCP connections only - press Elevate to count refused attempts and port scans' }
         Raise-Alert INFO 'Incoming counter' "Counting incoming attempts from: $how. Apps on this PC are listed but never alarm." 'inbound-noted'
     }
     if ($script:ConnForm -and -not $script:ConnForm.IsDisposed) { Update-ConnGrid }
@@ -1929,6 +1956,7 @@ if ($TestFirewallLog) {
 
 # -------- main window ---------------------------------------------------------
 Build-AllowList
+$script:OtherFw = Get-ThirdPartyFirewall
 Init-Bg
 Init-Evidence
 Load-Vendors

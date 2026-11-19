@@ -12,7 +12,7 @@ When it's running, Intrusion Monitor quietly keeps an eye on your own computer a
 
 - **Someone scanning your PC** — a tell-tale burst of probes against lots of your ports at once, the way automated attack tools start.
 - **Your PC contacting a known-bad address** — connections or web lookups to internet infrastructure linked to the ARTEX automated-attack toolkit.
-- **A tripwire being touched** — it quietly puts a tempting-looking decoy folder (and, if allowed, a decoy network share) in place; if anything pokes at it, you hear about it immediately. Nothing legitimate ever touches that folder, so an alert there is a real signal.
+- **A tripwire being touched** — it quietly puts a tempting-looking decoy folder in place (and, if you switch it on, a decoy network share); if anything pokes at it, you hear about it immediately. Nothing legitimate ever touches that folder, so an alert there is a real signal.
 - **New devices appearing** on your local network (shown as information, not an alarm), with their hardware (MAC) address and maker.
 - **Every incoming connection attempt, counted per address** — who has tried to connect to your PC, how many times, whether they were refused or let in, every port number they tried, and which program on your PC they were aiming at. Press **Connections** to see the table.
 
@@ -80,11 +80,11 @@ The zip's own fingerprint is copied to your clipboard and saved next to it. **Wr
 
 You don't really "install" it — you just download it and run it.
 
-1. On this page, click the green **Code** button, then **Download ZIP** (or grab the ZIP from the **Releases** section if one is published).
-2. Find the downloaded `IntrusionMonitor.zip` (usually in your **Downloads** folder), **right-click it**, and choose **Extract All…**, then **Extract**.
-3. Open the extracted **IntrusionMonitor** folder.
+1. On this page, click **Releases** (on the right), open the latest release, and click **Source code (zip)** under **Assets**. *(Or click the green **Code** button, then **Download ZIP**.)*
+2. Find the downloaded ZIP (usually in your **Downloads** folder), **right-click it**, and choose **Extract All…**, then **Extract**.
+3. Open the extracted **IntrusionMonitor** folder (its name may end in the version number, e.g. `IntrusionMonitor-2.0`).
 4. Double-click **`IntrusionMonitor.vbs`**. It starts silently in the background — no black command window — and sits minimised until it sees something.
-5. The first time, Windows may show a blue **"Windows protected your PC"** box, because the tool isn't signed by a big company. Click **More info**, then **Run anyway**. *(Normal for free, open tools.)*
+5. The first time, Windows may show a blue **"Windows protected your PC"** box, because the tool isn't signed by a big company. Click **More info**, then **Run anyway**. *(Normal for free, open tools.)* Some antivirus programs may also query it, because it reads the firewall log and can add firewall rules — the same things that make it useful. You can read every line of it in `IntrusionMonitor.ps1`.
 6. That's it — it's watching. The window only pops open when there's an alert to show you; otherwise it stays out of your way.
 
 To stop it, open the window (it pops up on an alert, or click its taskbar icon) and press **Stop**.
@@ -92,6 +92,13 @@ To stop it, open the window (it pops up on an alert, or click its taskbar icon) 
 ### Turning on blocking and full evidence (recommended)
 
 Blocking attackers and reading the Windows Firewall log need Administrator rights, so they're off until you ask. In the monitor window, press **Elevate** and answer **Yes** to the Windows prompt. It reopens in full mode, adding the **Disconnect & Block** button, inbound port-scan detection, counting of *refused* attempts (where scans show up), and the firewall log in evidence packs. Your own router and PC are never blockable, so you can't cut yourself off.
+
+### If your antivirus has its own firewall
+
+Some security suites (Kaspersky, Norton, ESET, Bitdefender and others) replace Windows Firewall with their own. Intrusion Monitor spots this automatically and tells you. In that case:
+
+- Windows Firewall's log stays empty, so Intrusion Monitor counts **live incoming connections** instead. Attempts your security suite *refused* are recorded in that product's own reports, not here.
+- The **Block** button still adds Windows Firewall rules, but your suite may ignore them, so Intrusion Monitor will remind you to block the address in your suite as well.
 
 ---
 
@@ -119,6 +126,27 @@ A red alert with an internet address will pop its own window showing who's behin
 | **Verify logs** | Checks that nothing in the evidence journal has been altered. |
 | **Open logs** | Opens the logs folder. |
 
+### The decoy network share (optional)
+
+When elevated, Intrusion Monitor can also publish a decoy network share called **Backups**. Nothing legitimate ever opens it, so anything that does is almost certainly scanning your network. It's **off by default**, because a share makes your PC visible to everyone on the same network — fine at home, not what you want on café or hotel Wi-Fi. To switch it on, change `ShareDecoyEnabled = $false` to `$true` near the top of `IntrusionMonitor.ps1`.
+
+---
+
+## Privacy — what leaves your PC
+
+Intrusion Monitor sends nothing about **you** anywhere. But to find out who is probing you, it looks up the **address of whoever connected to you** with these public services:
+
+| Service | What it's sent | Why |
+|---------|----------------|-----|
+| ip-api.com | The connecting address | Country, internet provider, network number. *Plain HTTP (not encrypted); free for personal, non-commercial use.* |
+| rdap.org (forwards to the official internet registries) | The connecting address | Who the address is registered to and its abuse contact. |
+| Your normal DNS | The connecting address | Its reverse DNS name. |
+| google.com | Nothing but a request for the time | Checking your PC clock. |
+| api.ipify.org | Nothing | Recording your own public address. |
+| IEEE / Wireshark | Nothing | Downloading the list of network-device makers (twice a year). |
+
+A traceroute sends ordinary network test packets towards the connecting address. All of this can be switched off in the settings at the top of `IntrusionMonitor.ps1` (`AutoIdentify`, `AutoTraceroute`, `ClockCheckMinutes = 0`, `IpLookupEnabled`).
+
 ---
 
 ## What it can't do (so you're not misled)
@@ -126,6 +154,7 @@ A red alert with an internet address will pop its own window showing who's behin
 - It watches **your own PC**. On a normal home or office network it **cannot** see attacks against your neighbour's machine — that traffic never reaches your computer. It is an early-warning sensor for *this* PC, not a whole-network scanner.
 - Blocking an address helps against a single attacker, but serious attackers hop between many addresses, so blocking one is a **speed bump, not a wall**. The real protection is keeping your PC patched, your firewall closed to the outside, and antivirus switched on. Intrusion Monitor is an extra pair of eyes, not a replacement for those.
 - The tamper-evidence proves the records weren't changed *after* they were written. Keep exported packs (and their fingerprints) somewhere other than the PC being attacked.
+- The list of known-bad ARTEX addresses is from public reporting in October–November 2026. Attackers change addresses, so that part of the detection ages; the scan, tripwire and connection-counting detections don't.
 
 ---
 
