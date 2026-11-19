@@ -2,7 +2,5 @@
 logs/
 data/
 
-# syntax-check and test scratch files
-_SyntaxCheck.ps1
-_syntaxresult.txt
-_test*
+# developer test kit (kept locally)
+dev-utilities/
